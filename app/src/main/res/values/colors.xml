@@ -1,0 +1,11 @@
+<resources>
+    <color name="app_bg">#F6F7FB</color>
+    <color name="card_bg">#FFFFFF</color>
+    <color name="primary">#2457F5</color>
+    <color name="primary_dark">#173DB2</color>
+    <color name="text_primary">#111827</color>
+    <color name="text_secondary">#667085</color>
+    <color name="success">#0F9D58</color>
+    <color name="danger">#D92D20</color>
+    <color name="border">#E4E7EC</color>
+</resources>
