@@ -33,10 +33,15 @@ import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Date;
 import java.util.Locale;
 
@@ -46,6 +51,7 @@ public class MainActivity extends Activity implements RecognitionListener {
     private static final int REQ_SAVE = 202;
     private static final String PREFS = "live_notes_prefs";
     private static final String KEY_DRAFT = "draft";
+    private static final String NOTES_DIR = "notes";
 
     private SpeechRecognizer recognizer;
     private Intent recognizerIntent;
@@ -56,6 +62,7 @@ public class MainActivity extends Activity implements RecognitionListener {
     private TextView timerView;
     private TextView liveHintView;
     private Button startStopButton;
+    private Button libraryButton;
     private Spinner languageSpinner;
     private Spinner delaySpinner;
 
@@ -67,6 +74,9 @@ public class MainActivity extends Activity implements RecognitionListener {
     private String committedText = "";
     private String pendingPartial = "";
     private String lastCommittedSegment = "";
+    private String currentNoteFileName = null;
+    private String pendingExportText = null;
+    private String pendingExportName = null;
     private Runnable pendingPartialRender;
 
     private final Runnable timerTick = new Runnable() {
@@ -87,6 +97,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         transcriptView.setText(committedText);
         transcriptView.setSelection(transcriptView.length());
         setupRecognizer();
+        refreshLibraryCount();
     }
 
     private void buildUi() {
@@ -108,7 +119,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         root.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("จดคำบรรยายจากเสียงเป็นข้อความแบบสด • ค่อย ๆ แสดงระหว่างพูด");
+        subtitle.setText("จดคำบรรยายจากเสียงเป็นข้อความแบบสด • แยกบันทึกเป็นไฟล์และจัดการย้อนหลังได้");
         subtitle.setTextSize(14);
         subtitle.setTextColor(Color.rgb(102, 112, 133));
         subtitle.setPadding(0, dp(4), 0, dp(14));
@@ -190,7 +201,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         root.addView(transcriptView, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(360)));
 
         liveHintView = new TextView(this);
-        liveHintView.setText("โหมดสดจะแสดงผลลัพธ์ชั่วคราวระหว่างพูด และอาจแก้คำล่าสุดเองเมื่อได้ยินชัดขึ้น");
+        liveHintView.setText("หยุดการฟังแล้วระบบจะบันทึกไฟล์ในคลังอัตโนมัติ • คำล่าสุดอาจถูกแก้เองเมื่อระบบได้ยินชัดขึ้น");
         liveHintView.setTextSize(12);
         liveHintView.setTextColor(Color.rgb(102, 112, 133));
         liveHintView.setPadding(dp(2), dp(8), dp(2), dp(10));
@@ -207,27 +218,46 @@ public class MainActivity extends Activity implements RecognitionListener {
         });
         root.addView(startStopButton, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(58)));
 
+        LinearLayout fileActions = new LinearLayout(this);
+        fileActions.setOrientation(LinearLayout.HORIZONTAL);
+        fileActions.setPadding(0, dp(10), 0, 0);
+
+        Button saveInside = smallButton("บันทึก");
+        saveInside.setOnClickListener(v -> manualSaveCurrentNote());
+        fileActions.addView(saveInside, new LinearLayout.LayoutParams(0, dp(48), 1f));
+
+        libraryButton = smallButton("คลังบันทึก");
+        libraryButton.setOnClickListener(v -> showNotesLibrary());
+        LinearLayout.LayoutParams libraryParams = new LinearLayout.LayoutParams(0, dp(48), 1f);
+        libraryParams.setMargins(dp(8), 0, dp(8), 0);
+        fileActions.addView(libraryButton, libraryParams);
+
+        Button newNote = smallButton("บันทึกใหม่");
+        newNote.setOnClickListener(v -> createNewNote());
+        fileActions.addView(newNote, new LinearLayout.LayoutParams(0, dp(48), 1f));
+        root.addView(fileActions);
+
         LinearLayout actions = new LinearLayout(this);
         actions.setOrientation(LinearLayout.HORIZONTAL);
-        actions.setPadding(0, dp(10), 0, 0);
+        actions.setPadding(0, dp(8), 0, 0);
 
         Button copy = smallButton("คัดลอก");
         copy.setOnClickListener(v -> copyText());
         actions.addView(copy, new LinearLayout.LayoutParams(0, dp(48), 1f));
 
-        Button save = smallButton("บันทึก .txt");
-        save.setOnClickListener(v -> saveTextFile());
-        LinearLayout.LayoutParams saveParams = new LinearLayout.LayoutParams(0, dp(48), 1f);
-        saveParams.setMargins(dp(8), 0, dp(8), 0);
-        actions.addView(save, saveParams);
+        Button export = smallButton("ส่งออก .txt");
+        export.setOnClickListener(v -> saveTextFile());
+        LinearLayout.LayoutParams exportParams = new LinearLayout.LayoutParams(0, dp(48), 1f);
+        exportParams.setMargins(dp(8), 0, dp(8), 0);
+        actions.addView(export, exportParams);
 
-        Button clear = smallButton("ล้าง");
+        Button clear = smallButton("ล้างหน้า");
         clear.setOnClickListener(v -> confirmClear());
         actions.addView(clear, new LinearLayout.LayoutParams(0, dp(48), 1f));
         root.addView(actions);
 
         TextView privacy = new TextView(this);
-        privacy.setText("หมายเหตุ: การรู้จำเสียงขึ้นกับ Speech Recognition Service ของเครื่อง และแพ็กภาษาในอุปกรณ์");
+        privacy.setText("ไฟล์ในคลังเก็บภายในพื้นที่ส่วนตัวของแอป • ลบเฉพาะรายการได้ • ส่งออกเป็น .txt ได้");
         privacy.setTextSize(11);
         privacy.setTextColor(Color.rgb(102,112,133));
         privacy.setGravity(Gravity.CENTER);
@@ -235,7 +265,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         root.addView(privacy);
 
         TextView version = new TextView(this);
-        version.setText("Version 1.0.0");
+        version.setText("Version 1.1.0");
         version.setTextSize(11);
         version.setTextColor(Color.rgb(152,162,179));
         version.setGravity(Gravity.CENTER);
@@ -305,7 +335,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         handler.post(timerTick);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        startStopButton.setText("■ หยุดจดบันทึก");
+        startStopButton.setText("■ หยุดและบันทึก");
         startStopButton.setBackground(roundRect(Color.rgb(217,45,32), dp(14), Color.rgb(217,45,32)));
         statusView.setText("● กำลังฟัง…");
         statusView.setTextColor(Color.rgb(15,157,88));
@@ -346,9 +376,16 @@ public class MainActivity extends Activity implements RecognitionListener {
 
         startStopButton.setText("● เริ่มจดบันทึกสด");
         startStopButton.setBackground(roundRect(Color.rgb(36,87,245), dp(14), Color.rgb(36,87,245)));
-        statusView.setText("● หยุดแล้ว — แก้ไขข้อความได้");
-        statusView.setTextColor(Color.rgb(102,112,133));
         persistDraft();
+
+        boolean saved = autoSaveCurrentNote(false);
+        if (saved) {
+            statusView.setText("● หยุดแล้ว • บันทึกเข้าไฟล์อัตโนมัติ");
+            statusView.setTextColor(Color.rgb(15,157,88));
+        } else {
+            statusView.setText("● หยุดแล้ว — ไม่มีข้อความให้บันทึก");
+            statusView.setTextColor(Color.rgb(102,112,133));
+        }
     }
 
     private void restartRecognizer(long delayMs) {
@@ -380,10 +417,248 @@ public class MainActivity extends Activity implements RecognitionListener {
         pendingPartial = "";
         renderCombinedText("");
         persistDraft();
+        if (currentNoteFileName != null) autoSaveCurrentNote(false);
     }
 
     private void persistDraft() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_DRAFT, transcriptView.getText().toString()).apply();
+    }
+
+    private File getNotesDir() {
+        File dir = new File(getFilesDir(), NOTES_DIR);
+        if (!dir.exists()) dir.mkdirs();
+        return dir;
+    }
+
+    private boolean autoSaveCurrentNote(boolean showToast) {
+        String text = transcriptView.getText().toString().trim();
+        if (text.isEmpty()) {
+            if (showToast) Toast.makeText(this, "ยังไม่มีข้อความให้บันทึก", Toast.LENGTH_SHORT).show();
+            return false;
+        }
+
+        if (currentNoteFileName == null) {
+            String ts = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+            currentNoteFileName = "lecture_" + ts + ".txt";
+        }
+
+        File file = new File(getNotesDir(), currentNoteFileName);
+        try (FileOutputStream fos = new FileOutputStream(file, false)) {
+            fos.write(text.getBytes(StandardCharsets.UTF_8));
+            fos.flush();
+            committedText = text;
+            persistDraft();
+            refreshLibraryCount();
+            if (showToast) Toast.makeText(this, "บันทึกไฟล์แล้ว", Toast.LENGTH_SHORT).show();
+            return true;
+        } catch (Exception e) {
+            if (showToast) Toast.makeText(this, "บันทึกไฟล์ไม่สำเร็จ", Toast.LENGTH_LONG).show();
+            return false;
+        }
+    }
+
+    private void manualSaveCurrentNote() {
+        if (listeningRequested) {
+            committedText = transcriptView.getText().toString().trim();
+        }
+        if (autoSaveCurrentNote(true)) {
+            statusView.setText("● บันทึกไฟล์แล้ว");
+            statusView.setTextColor(Color.rgb(15,157,88));
+        }
+    }
+
+    private void createNewNote() {
+        if (listeningRequested) stopLiveMode();
+        if (!transcriptView.getText().toString().trim().isEmpty() && currentNoteFileName == null) {
+            autoSaveCurrentNote(false);
+        }
+
+        committedText = "";
+        pendingPartial = "";
+        lastCommittedSegment = "";
+        currentNoteFileName = null;
+        transcriptView.setText("");
+        timerView.setText("00:00:00");
+        startedAt = 0L;
+        persistDraft();
+        statusView.setText("● บันทึกใหม่ — พร้อมเริ่ม");
+        statusView.setTextColor(Color.rgb(36,87,245));
+    }
+
+    private void refreshLibraryCount() {
+        if (libraryButton == null) return;
+        File[] files = listNoteFiles();
+        libraryButton.setText("คลังบันทึก (" + files.length + ")");
+    }
+
+    private File[] listNoteFiles() {
+        File[] files = getNotesDir().listFiles(file ->
+                file.isFile() && file.getName().toLowerCase(Locale.US).endsWith(".txt"));
+        if (files == null) files = new File[0];
+        Arrays.sort(files, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+        return files;
+    }
+
+    private String readNoteFile(File file) {
+        try (FileInputStream fis = new FileInputStream(file);
+             ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[4096];
+            int n;
+            while ((n = fis.read(buffer)) > 0) {
+                bos.write(buffer, 0, n);
+            }
+            return new String(bos.toByteArray(), StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String noteDisplayTitle(File file) {
+        String date = new SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.US).format(new Date(file.lastModified()));
+        return "บันทึก " + date;
+    }
+
+    private String noteSnippet(String text) {
+        if (text == null) return "";
+        String clean = text.replace("\n", " ").replace("\r", " ").trim();
+        return clean.length() > 80 ? clean.substring(0, 80) + "…" : clean;
+    }
+
+    private void showNotesLibrary() {
+        File[] files = listNoteFiles();
+
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(12), dp(8), dp(12), dp(8));
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(content);
+
+        final AlertDialog[] holder = new AlertDialog[1];
+
+        if (files.length == 0) {
+            TextView empty = new TextView(this);
+            empty.setText("ยังไม่มีไฟล์บันทึก\nเมื่อกดหยุดการฟัง ระบบจะบันทึกเข้าในคลังอัตโนมัติ");
+            empty.setGravity(Gravity.CENTER);
+            empty.setTextSize(15);
+            empty.setTextColor(Color.rgb(102,112,133));
+            empty.setPadding(dp(18), dp(28), dp(18), dp(28));
+            content.addView(empty);
+        } else {
+            for (File file : files) {
+                String text = readNoteFile(file);
+
+                LinearLayout card = new LinearLayout(this);
+                card.setOrientation(LinearLayout.VERTICAL);
+                card.setPadding(dp(14), dp(12), dp(14), dp(12));
+                card.setBackground(roundRect(Color.WHITE, dp(14), Color.rgb(228,231,236)));
+
+                TextView cardTitle = new TextView(this);
+                cardTitle.setText(noteDisplayTitle(file));
+                cardTitle.setTextSize(15);
+                cardTitle.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+                cardTitle.setTextColor(Color.rgb(17,24,39));
+                card.addView(cardTitle);
+
+                TextView snippet = new TextView(this);
+                snippet.setText(noteSnippet(text));
+                snippet.setTextSize(13);
+                snippet.setTextColor(Color.rgb(102,112,133));
+                snippet.setPadding(0, dp(5), 0, dp(9));
+                card.addView(snippet);
+
+                LinearLayout buttons = new LinearLayout(this);
+                buttons.setOrientation(LinearLayout.HORIZONTAL);
+
+                Button open = smallButton("เปิด");
+                open.setOnClickListener(v -> {
+                    openNote(file);
+                    if (holder[0] != null) holder[0].dismiss();
+                });
+                buttons.addView(open, new LinearLayout.LayoutParams(0, dp(44), 1f));
+
+                Button export = smallButton("ส่งออก");
+                export.setOnClickListener(v -> {
+                    exportNote(file);
+                    if (holder[0] != null) holder[0].dismiss();
+                });
+                LinearLayout.LayoutParams exportP = new LinearLayout.LayoutParams(0, dp(44), 1f);
+                exportP.setMargins(dp(7), 0, dp(7), 0);
+                buttons.addView(export, exportP);
+
+                Button delete = smallButton("ลบ");
+                delete.setTextColor(Color.rgb(217,45,32));
+                delete.setOnClickListener(v -> confirmDeleteNote(file, holder[0]));
+                buttons.addView(delete, new LinearLayout.LayoutParams(0, dp(44), 1f));
+
+                card.addView(buttons);
+
+                LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT);
+                cardParams.setMargins(0, 0, 0, dp(10));
+                content.addView(card, cardParams);
+            }
+        }
+
+        holder[0] = new AlertDialog.Builder(this)
+                .setTitle("คลังบันทึก • " + files.length + " ไฟล์")
+                .setView(scroll)
+                .setNegativeButton("ปิด", null)
+                .create();
+        holder[0].show();
+    }
+
+    private void openNote(File file) {
+        if (listeningRequested) stopLiveMode();
+        String text = readNoteFile(file);
+        if (text == null) {
+            Toast.makeText(this, "เปิดไฟล์ไม่สำเร็จ", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        currentNoteFileName = file.getName();
+        committedText = text.trim();
+        pendingPartial = "";
+        lastCommittedSegment = "";
+        transcriptView.setText(text);
+        transcriptView.setSelection(transcriptView.length());
+        persistDraft();
+        statusView.setText("● เปิด " + noteDisplayTitle(file));
+        statusView.setTextColor(Color.rgb(36,87,245));
+    }
+
+    private void confirmDeleteNote(File file, AlertDialog libraryDialog) {
+        new AlertDialog.Builder(this)
+                .setTitle("ลบบันทึกนี้?")
+                .setMessage(noteDisplayTitle(file) + "\n\nเมื่อลบแล้วจะไม่สามารถเรียกคืนจากแอปได้")
+                .setNegativeButton("ยกเลิก", null)
+                .setPositiveButton("ลบ", (dialog, which) -> {
+                    boolean deleted = file.delete();
+                    if (deleted) {
+                        if (file.getName().equals(currentNoteFileName)) {
+                            currentNoteFileName = null;
+                        }
+                        refreshLibraryCount();
+                        Toast.makeText(this, "ลบไฟล์แล้ว", Toast.LENGTH_SHORT).show();
+                        if (libraryDialog != null) libraryDialog.dismiss();
+                        handler.postDelayed(this::showNotesLibrary, 120);
+                    } else {
+                        Toast.makeText(this, "ลบไฟล์ไม่สำเร็จ", Toast.LENGTH_LONG).show();
+                    }
+                })
+                .show();
+    }
+
+    private void exportNote(File file) {
+        String text = readNoteFile(file);
+        if (text == null) {
+            Toast.makeText(this, "อ่านไฟล์ไม่สำเร็จ", Toast.LENGTH_LONG).show();
+            return;
+        }
+        pendingExportText = text;
+        pendingExportName = file.getName();
+        launchExportDocument();
     }
 
     private void copyText() {
@@ -393,25 +668,40 @@ public class MainActivity extends Activity implements RecognitionListener {
     }
 
     private void saveTextFile() {
+        String text = transcriptView.getText().toString();
+        if (text.trim().isEmpty()) {
+            Toast.makeText(this, "ยังไม่มีข้อความให้ส่งออก", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        pendingExportText = text;
+        String ts = new SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(new Date());
+        pendingExportName = currentNoteFileName != null ? currentNoteFileName : "lecture_notes_" + ts + ".txt";
+        launchExportDocument();
+    }
+
+    private void launchExportDocument() {
         Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("text/plain");
-        String ts = new SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(new Date());
-        intent.putExtra(Intent.EXTRA_TITLE, "lecture_notes_" + ts + ".txt");
+        intent.putExtra(Intent.EXTRA_TITLE, pendingExportName == null ? "lecture_notes.txt" : pendingExportName);
         startActivityForResult(intent, REQ_SAVE);
     }
 
     private void confirmClear() {
         new AlertDialog.Builder(this)
-                .setTitle("ล้างข้อความทั้งหมด?")
-                .setMessage("ข้อความที่ยังไม่ได้บันทึกเป็นไฟล์จะถูกลบ")
+                .setTitle("ล้างข้อความหน้านี้?")
+                .setMessage("ไฟล์ที่บันทึกไว้ในคลังจะไม่ถูกลบ")
                 .setNegativeButton("ยกเลิก", null)
-                .setPositiveButton("ล้าง", (dialog, which) -> {
+                .setPositiveButton("ล้างหน้า", (dialog, which) -> {
+                    if (listeningRequested) stopLiveMode();
                     committedText = "";
                     pendingPartial = "";
                     lastCommittedSegment = "";
+                    currentNoteFileName = null;
                     transcriptView.setText("");
                     persistDraft();
+                    statusView.setText("● ล้างหน้าปัจจุบันแล้ว");
+                    statusView.setTextColor(Color.rgb(102,112,133));
                 })
                 .show();
     }
@@ -422,13 +712,17 @@ public class MainActivity extends Activity implements RecognitionListener {
         if (requestCode == REQ_SAVE && resultCode == RESULT_OK && data != null) {
             Uri uri = data.getData();
             if (uri == null) return;
+            String exportText = pendingExportText != null ? pendingExportText : transcriptView.getText().toString();
             try (OutputStream os = getContentResolver().openOutputStream(uri)) {
                 if (os != null) {
-                    os.write(transcriptView.getText().toString().getBytes(StandardCharsets.UTF_8));
-                    Toast.makeText(this, "บันทึกไฟล์แล้ว", Toast.LENGTH_SHORT).show();
+                    os.write(exportText.getBytes(StandardCharsets.UTF_8));
+                    Toast.makeText(this, "ส่งออกไฟล์แล้ว", Toast.LENGTH_SHORT).show();
                 }
             } catch (Exception e) {
-                Toast.makeText(this, "บันทึกไฟล์ไม่สำเร็จ", Toast.LENGTH_LONG).show();
+                Toast.makeText(this, "ส่งออกไฟล์ไม่สำเร็จ", Toast.LENGTH_LONG).show();
+            } finally {
+                pendingExportText = null;
+                pendingExportName = null;
             }
         }
     }
@@ -535,6 +829,9 @@ public class MainActivity extends Activity implements RecognitionListener {
     protected void onPause() {
         super.onPause();
         persistDraft();
+        if (currentNoteFileName != null && !transcriptView.getText().toString().trim().isEmpty()) {
+            autoSaveCurrentNote(false);
+        }
     }
 
     @Override
