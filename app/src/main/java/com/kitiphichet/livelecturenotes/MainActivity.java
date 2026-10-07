@@ -69,6 +69,8 @@ public class MainActivity extends Activity implements RecognitionListener {
     private boolean listeningRequested = false;
     private boolean recognizerRunning = false;
     private long startedAt = 0L;
+    private long lastRecognizerActivityAt = 0L;
+    private long lastCommittedAt = 0L;
     private int displayDelayMs = 250;
     private String languageCode = "th-TH";
     private String committedText = "";
@@ -86,6 +88,24 @@ public class MainActivity extends Activity implements RecognitionListener {
             long sec = elapsed / 1000;
             timerView.setText(String.format(Locale.US, "%02d:%02d:%02d", sec / 3600, (sec % 3600) / 60, sec % 60));
             handler.postDelayed(this, 1000);
+        }
+    };
+
+    // Keeps the native Android recognizer alive for long lectures. Some devices end
+    // a recognition session after silence or after an internal service timeout.
+    private final Runnable continuousWatchdog = new Runnable() {
+        @Override public void run() {
+            if (!listeningRequested) return;
+            long now = SystemClock.elapsedRealtime();
+            long inactiveFor = now - lastRecognizerActivityAt;
+
+            if (!recognizerRunning || inactiveFor > 8000L) {
+                commitPendingPartial();
+                try { if (recognizer != null) recognizer.cancel(); } catch (Exception ignored) {}
+                recognizerRunning = false;
+                startRecognizerNow();
+            }
+            handler.postDelayed(this, 2000L);
         }
     };
 
@@ -119,7 +139,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         root.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("จดคำบรรยายจากเสียงเป็นข้อความแบบสด • แยกบันทึกเป็นไฟล์และจัดการย้อนหลังได้");
+        subtitle.setText("ถอดเสียงต่อเนื่องจนกว่าจะกดหยุด • ข้อความสะสมไม่หายระหว่างรอบฟัง");
         subtitle.setTextSize(14);
         subtitle.setTextColor(Color.rgb(102, 112, 133));
         subtitle.setPadding(0, dp(4), 0, dp(14));
@@ -201,7 +221,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         root.addView(transcriptView, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(360)));
 
         liveHintView = new TextView(this);
-        liveHintView.setText("หยุดการฟังแล้วระบบจะบันทึกไฟล์ในคลังอัตโนมัติ • คำล่าสุดอาจถูกแก้เองเมื่อระบบได้ยินชัดขึ้น");
+        liveHintView.setText("โหมดต่อเนื่อง: ระบบจะต่อรอบฟังให้อัตโนมัติเมื่อ Android จบช่วงเสียง และสะสมข้อความไว้จนกว่าจะกดหยุด");
         liveHintView.setTextSize(12);
         liveHintView.setTextColor(Color.rgb(102, 112, 133));
         liveHintView.setPadding(dp(2), dp(8), dp(2), dp(10));
@@ -265,7 +285,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         root.addView(privacy);
 
         TextView version = new TextView(this);
-        version.setText("Version 1.1.0");
+        version.setText("Version 1.2.0");
         version.setTextSize(11);
         version.setTextColor(Color.rgb(152,162,179));
         version.setGravity(Gravity.CENTER);
@@ -330,14 +350,17 @@ public class MainActivity extends Activity implements RecognitionListener {
         transcriptView.setFocusableInTouchMode(false);
         listeningRequested = true;
         startedAt = SystemClock.elapsedRealtime();
+        lastRecognizerActivityAt = startedAt;
         timerView.setText("00:00:00");
         handler.removeCallbacks(timerTick);
+        handler.removeCallbacks(continuousWatchdog);
         handler.post(timerTick);
+        handler.postDelayed(continuousWatchdog, 2000L);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
         startStopButton.setText("■ หยุดและบันทึก");
         startStopButton.setBackground(roundRect(Color.rgb(217,45,32), dp(14), Color.rgb(217,45,32)));
-        statusView.setText("● กำลังฟัง…");
+        statusView.setText("● กำลังฟังต่อเนื่อง…");
         statusView.setTextColor(Color.rgb(15,157,88));
         startRecognizerNow();
     }
@@ -347,6 +370,7 @@ public class MainActivity extends Activity implements RecognitionListener {
         recognizerIntent = buildRecognizerIntent();
         try {
             recognizerRunning = true;
+            lastRecognizerActivityAt = SystemClock.elapsedRealtime();
             recognizer.startListening(recognizerIntent);
         } catch (Exception e) {
             recognizerRunning = false;
@@ -358,7 +382,9 @@ public class MainActivity extends Activity implements RecognitionListener {
     private void stopLiveMode() {
         listeningRequested = false;
         handler.removeCallbacks(timerTick);
+        handler.removeCallbacks(continuousWatchdog);
         if (pendingPartialRender != null) handler.removeCallbacks(pendingPartialRender);
+        commitPendingPartial();
         pendingPartial = "";
 
         if (recognizer != null) {
@@ -390,9 +416,19 @@ public class MainActivity extends Activity implements RecognitionListener {
 
     private void restartRecognizer(long delayMs) {
         if (!listeningRequested) return;
+        commitPendingPartial();
         try { if (recognizer != null) recognizer.cancel(); } catch (Exception ignored) {}
         recognizerRunning = false;
-        handler.postDelayed(this::startRecognizerNow, delayMs);
+        lastRecognizerActivityAt = SystemClock.elapsedRealtime();
+        handler.postDelayed(this::startRecognizerNow, Math.max(60L, delayMs));
+    }
+
+    private void commitPendingPartial() {
+        String p = pendingPartial == null ? "" : pendingPartial.trim();
+        if (!p.isEmpty()) {
+            appendFinal(p);
+            pendingPartial = "";
+        }
     }
 
     private void renderCombinedText(String partial) {
@@ -410,8 +446,10 @@ public class MainActivity extends Activity implements RecognitionListener {
         if (segment == null) return;
         String s = segment.trim();
         if (s.isEmpty()) return;
-        if (s.equals(lastCommittedSegment)) return;
+        long now = SystemClock.elapsedRealtime();
+        if (s.equals(lastCommittedSegment) && (now - lastCommittedAt) < 1200L) return;
         lastCommittedSegment = s;
+        lastCommittedAt = now;
         if (committedText == null || committedText.trim().isEmpty()) committedText = s;
         else committedText = committedText.trim() + " " + s;
         pendingPartial = "";
@@ -748,37 +786,47 @@ public class MainActivity extends Activity implements RecognitionListener {
     }
 
     @Override public void onReadyForSpeech(Bundle params) {
-        statusView.setText("● พร้อมรับเสียง");
+        lastRecognizerActivityAt = SystemClock.elapsedRealtime();
+        statusView.setText("● กำลังฟังต่อเนื่อง…");
         statusView.setTextColor(Color.rgb(15,157,88));
     }
 
     @Override public void onBeginningOfSpeech() {
-        statusView.setText("● กำลังถอดคำ…");
+        lastRecognizerActivityAt = SystemClock.elapsedRealtime();
+        statusView.setText("● กำลังถอดคำต่อเนื่อง…");
     }
 
-    @Override public void onRmsChanged(float rmsdB) {}
-    @Override public void onBufferReceived(byte[] buffer) {}
+    @Override public void onRmsChanged(float rmsdB) {
+        lastRecognizerActivityAt = SystemClock.elapsedRealtime();
+    }
+
+    @Override public void onBufferReceived(byte[] buffer) {
+        lastRecognizerActivityAt = SystemClock.elapsedRealtime();
+    }
 
     @Override public void onEndOfSpeech() {
-        statusView.setText("● ประมวลผลช่วงล่าสุด…");
+        lastRecognizerActivityAt = SystemClock.elapsedRealtime();
+        statusView.setText("● กำลังต่อรอบการฟัง…");
     }
 
     @Override
     public void onError(int error) {
         recognizerRunning = false;
+        lastRecognizerActivityAt = SystemClock.elapsedRealtime();
         if (!listeningRequested) return;
 
-        long delay = 350;
+        commitPendingPartial();
+        long delay = 120;
         switch (error) {
             case SpeechRecognizer.ERROR_RECOGNIZER_BUSY:
                 statusView.setText("● กำลังต่อรอบการฟัง…");
-                delay = 800;
+                delay = 350;
                 break;
             case SpeechRecognizer.ERROR_NETWORK:
             case SpeechRecognizer.ERROR_NETWORK_TIMEOUT:
             case SpeechRecognizer.ERROR_SERVER:
                 statusView.setText("● สัญญาณไม่เสถียร — ลองใหม่อัตโนมัติ");
-                delay = 1200;
+                delay = 800;
                 break;
             case SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS:
                 statusView.setText("● ไม่มีสิทธิ์ใช้ไมโครโฟน");
@@ -786,16 +834,16 @@ public class MainActivity extends Activity implements RecognitionListener {
                 return;
             case SpeechRecognizer.ERROR_AUDIO:
                 statusView.setText("● ไมโครโฟนขัดข้อง — ลองใหม่");
-                delay = 900;
+                delay = 500;
                 break;
             case SpeechRecognizer.ERROR_NO_MATCH:
             case SpeechRecognizer.ERROR_SPEECH_TIMEOUT:
-                statusView.setText("● กำลังฟัง…");
-                delay = 250;
+                statusView.setText("● กำลังฟังต่อเนื่อง…");
+                delay = 80;
                 break;
             default:
                 statusView.setText("● กำลังเริ่มฟังใหม่…");
-                delay = 600;
+                delay = 250;
         }
         restartRecognizer(delay);
     }
@@ -803,16 +851,19 @@ public class MainActivity extends Activity implements RecognitionListener {
     @Override
     public void onResults(Bundle results) {
         recognizerRunning = false;
+        lastRecognizerActivityAt = SystemClock.elapsedRealtime();
         ArrayList<String> matches = results == null ? null : results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
         if (matches != null && !matches.isEmpty()) appendFinal(matches.get(0));
+        pendingPartial = "";
         if (listeningRequested) {
-            statusView.setText("● กำลังฟังต่อ…");
-            handler.postDelayed(this::startRecognizerNow, 180);
+            statusView.setText("● กำลังฟังต่อเนื่อง…");
+            handler.postDelayed(this::startRecognizerNow, 60L);
         }
     }
 
     @Override
     public void onPartialResults(Bundle partialResults) {
+        lastRecognizerActivityAt = SystemClock.elapsedRealtime();
         ArrayList<String> matches = partialResults == null ? null : partialResults.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
         if (matches == null || matches.isEmpty()) return;
         pendingPartial = matches.get(0);
